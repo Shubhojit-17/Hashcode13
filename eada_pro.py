@@ -1,8 +1,3 @@
-# =============================================================
-# EADA Pro - Smart Workspace Optimizer (Hackathon Edition)
-# Advanced Ergonomics + Accessibility + Performance Optimization
-# =============================================================
-
 import cv2
 import numpy as np
 import sounddevice as sd
@@ -11,12 +6,10 @@ import time
 import threading
 import os
 import json
-import vlc
 import screen_brightness_control as sbc
 from datetime import datetime
-from ctypes import cast, POINTER
-from comtypes import CLSCTX_ALL
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+import platform  # CHANGED: Added for OS detection
+from pynput.keyboard import Key, Controller # CHANGED: For cross-platform media keys
 
 # --- MediaPipe Solutions ---
 mp_face_mesh = mp.solutions.face_mesh
@@ -161,7 +154,7 @@ class ErgonomicsMonitor:
             
             # Horizontal eye landmark
             h = np.linalg.norm(np.array([eye_landmarks[0].x, eye_landmarks[0].y]) - 
-                              np.array([eye_landmarks[3].x, eye_landmarks[3].y]))
+                               np.array([eye_landmarks[3].x, eye_landmarks[3].y]))
             
             if h == 0:
                 return 0.0
@@ -301,13 +294,13 @@ class ErgonomicsMonitor:
         # Calculate comprehensive posture metrics
         try:
             # Get key body landmarks (MediaPipe Pose indices)
-            nose = landmarks[0]              # Head position
-            left_shoulder = landmarks[11]    # Left shoulder
-            right_shoulder = landmarks[12]   # Right shoulder
-            left_hip = landmarks[23]         # Left hip
-            right_hip = landmarks[24]        # Right hip
-            left_ear = landmarks[7]          # Left ear
-            right_ear = landmarks[8]         # Right ear
+            nose = landmarks[0]             # Head position
+            left_shoulder = landmarks[11]   # Left shoulder
+            right_shoulder = landmarks[12]  # Right shoulder
+            left_hip = landmarks[23]        # Left hip
+            right_hip = landmarks[24]       # Right hip
+            left_ear = landmarks[7]         # Left ear
+            right_ear = landmarks[8]        # Right ear
             
             # === Metric 1: Shoulder Alignment (should be level) ===
             shoulder_diff = abs(left_shoulder.y - right_shoulder.y)
@@ -391,8 +384,9 @@ class WorkspaceOptimizer:
         self.session_duration = 0
         self.alerts = []
         
-        # Audio setup
-        self._setup_audio()
+        # CHANGED: Moved all OS-specific setup to its own method
+        self.platform = platform.system()  # "Windows", "Darwin" (macOS), "Linux"
+        self._setup_platform_specifics()
         
         # Initialize workspace state with stability tracking
         self.brightness = 50
@@ -417,13 +411,44 @@ class WorkspaceOptimizer:
         self.last_volume = 50
         self.last_distance_for_volume = 1.0  # Track distance for volume calculations
         self.volume_change_threshold = 2  # Minimum 2% change to apply (more responsive)
+    
+    # CHANGED: New method to handle OS-specific initialization
+    def _setup_platform_specifics(self):
+        """Initialize OS-specific controllers for audio and media keys."""
         
-    def _setup_audio(self):
-        """Setup audio monitoring and control"""
-        self.speakers = AudioUtilities.GetSpeakers()
-        self.endpoint = self.speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        self.volume_controller = cast(self.endpoint, POINTER(IAudioEndpointVolume))
-        
+        # 1. Setup Audio Controller
+        self.volume_controller = None
+        if self.platform == "Windows":
+            try:
+                # These imports will only run on Windows
+                from comtypes import CLSCTX_ALL
+                from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+                from ctypes import cast, POINTER
+                
+                self.speakers = AudioUtilities.GetSpeakers()
+                self.endpoint = self.speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                self.volume_controller = cast(self.endpoint, POINTER(IAudioEndpointVolume))
+                print("✅ Successfully initialized Windows audio controller (pycaw).")
+            except Exception as e:
+                print(f"⚠️ Failed to initialize Windows audio controller (pycaw): {e}")
+                print("   Volume control will be disabled.")
+        elif self.platform == "Darwin":
+            # On macOS, we just use osascript, so no controller object is needed
+            self.volume_controller = "macos_osascript" # Use a flag
+            print("✅ Initialized macOS audio controller (osascript).")
+        else:
+            print(f"⚠️ Volume control is not supported on this platform: {self.platform}")
+
+        # 2. Setup Media Key Controller (using pynput for all platforms)
+        self.keyboard_controller = None
+        try:
+            self.keyboard_controller = Controller()
+            self.media_key = Key.media_play_pause
+            print("✅ Successfully initialized cross-platform media key controller (pynput).")
+        except Exception as e:
+            print(f"⚠️ Failed to initialize media key controller (pynput): {e}")
+            print("   Media pause/resume will be disabled.")
+
     def optimize_workspace(self, distance, noise_level, face_landmarks, pose_landmarks):
         """Main optimization function with stability checks"""
         # Update session metrics
@@ -500,6 +525,7 @@ class WorkspaceOptimizer:
             self.color_temp = min(self.color_temp, 4500)  # Warmer at night
         
         # Try to set brightness with graceful fallback
+        # screen_brightness_control is cross-platform, so this should work
         try:
             sbc.set_brightness(int(self.brightness))
         except KeyboardInterrupt:
@@ -517,22 +543,15 @@ class WorkspaceOptimizer:
         distance_delta = distance - self.last_distance_for_volume
         
         # Distance-based volume with VERY STEEP curve
-        # For every 0.05m change in distance, apply ~10% volume change (doubled from 5%)
-        # Closer = lower volume, Farther = higher volume
-        
-        # Use square root for extremely pronounced changes
-        # Map distance to volume: 0.25m → 20%, 4.0m → 100%
         distance_normalized = (distance - MIN_DISTANCE_M) / (MAX_DISTANCE_M - MIN_DISTANCE_M)
         distance_normalized = np.clip(distance_normalized, 0, 1)
         
         # Extremely steep curve: volume = 20 + 80 * (normalized^0.4)
-        # This creates massive changes with small movements
         distance_volume = 20 + 80 * (distance_normalized ** 0.4)
         
         # For 0.05m change, we want ~10% volume change (doubled)
         # Amplify based on distance delta
         if abs(distance_delta) >= 0.05:
-            # Calculate expected volume change: ~10% per 0.05m
             expected_change = (distance_delta / 0.05) * 10.0
             distance_volume += expected_change
             distance_volume = np.clip(distance_volume, 15, 100)
@@ -549,8 +568,17 @@ class WorkspaceOptimizer:
             self.last_volume = self.volume
             self.last_distance_for_volume = distance  # Update tracked distance
             
+            # CHANGED: Use OS-specific volume control
             try:
-                self.volume_controller.SetMasterVolumeLevelScalar(self.volume / 100.0, None)
+                if self.platform == "Windows" and self.volume_controller:
+                    # Windows (pycaw) uses a scalar from 0.0 to 1.0
+                    self.volume_controller.SetMasterVolumeLevelScalar(self.volume / 100.0, None)
+                
+                elif self.platform == "Darwin":
+                    # macOS (osascript) uses a value from 0 to 100
+                    volume_int = int(self.volume)
+                    os.system(f"osascript -e 'set volume output volume {volume_int}'")
+                
                 print(f"🔊 Volume: {self.volume:.1f}% (Δdist={distance_delta:+.2f}m, Δvol={volume_diff:+.1f}%)")
             except Exception as e:
                 pass
@@ -558,27 +586,22 @@ class WorkspaceOptimizer:
             # Keep current volume (too small change)
             self.volume = self.last_volume
     
+    # CHANGED: Replaced win32api with pynput
     def _pause_media(self):
-        """Pause media playback using Windows media keys"""
-        try:
-            import win32api
-            import win32con
-            # Simulate media play/pause key (VK_MEDIA_PLAY_PAUSE = 0xB3)
-            win32api.keybd_event(0xB3, 0, 0, 0)
-            win32api.keybd_event(0xB3, 0, win32con.KEYEVENTF_KEYUP, 0)
-        except Exception as e:
-            pass
+        """Pause/Resume media playback using cross-platform media keys"""
+        if self.keyboard_controller:
+            try:
+                self.keyboard_controller.press(self.media_key)
+                self.keyboard_controller.release(self.media_key)
+            except Exception as e:
+                print(f"Error pressing media key: {e}")
+                pass
     
+    # CHANGED: Replaced win32api with pynput
     def _resume_media(self):
-        """Resume media playback using Windows media keys"""
-        try:
-            import win32api
-            import win32con
-            # Simulate media play/pause key
-            win32api.keybd_event(0xB3, 0, 0, 0)
-            win32api.keybd_event(0xB3, 0, win32con.KEYEVENTF_KEYUP, 0)
-        except Exception as e:
-            pass
+        """Pause/Resume media playback using cross-platform media keys"""
+        # This is the same as pause, as it's a toggle key
+        self._pause_media()
     
     def _check_health_alerts(self):
         """Generate health and ergonomics alerts with eye strain"""
